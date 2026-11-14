@@ -1,0 +1,131 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>지도원 QR 스캔</title>
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<style>
+  *{box-sizing:border-box}
+  body{margin:0;font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;background:#111;color:#fff}
+  .wrap{max-width:480px;margin:0 auto;padding:12px}
+  #reader{width:100%;border-radius:12px;overflow:hidden;background:#000}
+  button{width:100%;padding:16px;font-size:18px;border:0;border-radius:12px;background:#2563eb;color:#fff;font-weight:700;margin-bottom:12px}
+  #result{margin:12px 0;padding:18px;border-radius:12px;text-align:center;background:#333;min-height:96px}
+  #result .big{font-size:26px;font-weight:800}
+  #result .sub{font-size:16px;margin-top:6px}
+  #result.ok{background:#16a34a}
+  #result.used{background:#ea580c}
+  #result.period,#result.invalid,#result.auth{background:#dc2626}
+  h2{font-size:16px;margin:20px 0 8px;color:#bbb}
+  ul{list-style:none;padding:0;margin:0}
+  li{padding:10px 12px;border-bottom:1px solid #333;font-size:16px}
+  li small{display:block;color:#999;font-size:13px;margin-top:2px}
+  .small{background:#444;font-size:14px;padding:10px;margin-top:20px}
+</style>
+</head>
+<body>
+<div class="wrap">
+  <button id="start">📷 스캔 시작</button>
+  <div id="reader"></div>
+  <div id="result"><div class="big">QR을 스캔해 주세요</div></div>
+  <h2>오늘 확인 목록 <span id="count"></span></h2>
+  <ul id="today"></ul>
+  <button id="resetPin" class="small">PIN 다시 입력</button>
+</div>
+
+<script>
+const API_URL = 'https://script.google.com/macros/s/AKfycbzak8nUZCw9rXO-_dXclDIi7gfujD3rXkOiDZE2f_LLT0YQ9U-Fs4F1kEqhOnKqplAU/exec';
+
+const $ = id => document.getElementById(id);
+let busy = false, lastCode = '', lastAt = 0;
+
+function getPin() {
+  let p = localStorage.getItem('staffPin');
+  if (!p) { p = prompt('지도원 PIN을 입력하세요') || ''; localStorage.setItem('staffPin', p); }
+  return p;
+}
+
+async function call(params) {
+  params.pin = getPin();
+  params.t = Date.now();
+  const res = await fetch(API_URL + '?' + new URLSearchParams(params));
+  const j = await res.json();
+  if (j.type === 'auth') localStorage.removeItem('staffPin');
+  return j;
+}
+
+function showResult(r) {
+  const el = $('result');
+  el.className = r.type || '';
+  el.innerHTML = '';
+  const titles = { ok: '✅ 확인 완료', used: '⚠️ 이미 확인 처리됨', period: '❌ 수강 기간 아님',
+                   invalid: '❌ 확인 불가', auth: '🔒 PIN 오류', loading: '확인 중...' };
+  const big = document.createElement('div'); big.className = 'big';
+  big.textContent = titles[r.type] || '';
+  el.appendChild(big);
+  if (r.name) {
+    const s1 = document.createElement('div'); s1.className = 'sub';
+    s1.textContent = `${r.name} ${r.phone4} · ${r.course}`;
+    el.appendChild(s1);
+  }
+  if (r.msg && r.type !== 'loading') {
+    const s2 = document.createElement('div'); s2.className = 'sub';
+    s2.textContent = r.msg;
+    el.appendChild(s2);
+  }
+}
+
+async function onScan(text) {
+  const now = Date.now();
+  if (busy || (text === lastCode && now - lastAt < 4000)) return; // 같은 QR 연속 인식 방지
+  busy = true; lastCode = text; lastAt = now;
+  showResult({ type: 'loading' });
+  try {
+    const r = await call({ action: 'scan', code: text });
+    showResult(r);
+    if (navigator.vibrate) navigator.vibrate(r.ok ? 120 : [120, 80, 120]);
+    loadToday();
+  } catch (e) {
+    showResult({ type: 'invalid', msg: '네트워크 오류입니다. 다시 스캔해 주세요.' });
+  } finally {
+    setTimeout(() => busy = false, 1500);
+  }
+}
+
+async function loadToday() {
+  try {
+    const r = await call({ action: 'today' });
+    if (!r.ok) return;
+    $('count').textContent = `(${r.list.length}건)`;
+    const ul = $('today'); ul.innerHTML = '';
+    r.list.forEach(x => {
+      const li = document.createElement('li');
+      const a = document.createElement('div');
+      a.textContent = `${x.name} ${x.phone4} (${x.time} 확인)`;
+      const b = document.createElement('small');
+      b.textContent = x.course;
+      li.append(a, b); ul.appendChild(li);
+    });
+  } catch (e) {}
+}
+
+$('start').onclick = async () => {
+  const btn = $('start'); btn.disabled = true;
+  try {
+    const scanner = new Html5Qrcode('reader');
+    await scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 } }, onScan, () => {});
+    btn.style.display = 'none';
+  } catch (e) {
+    btn.disabled = false;
+    showResult({ type: 'invalid', msg: '카메라를 켤 수 없습니다. 브라우저의 카메라 권한을 허용해 주세요.' });
+  }
+};
+
+$('resetPin').onclick = () => { localStorage.removeItem('staffPin'); getPin(); loadToday(); };
+
+loadToday();
+setInterval(loadToday, 30000); // 지도원 여러 명일 때 목록 동기화
+</script>
+</body>
+</html>
