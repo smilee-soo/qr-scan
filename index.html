@@ -11,6 +11,7 @@
   .wrap{max-width:480px;margin:0 auto;padding:12px}
   #reader{width:100%;border-radius:12px;overflow:hidden;background:#000}
   button{width:100%;padding:16px;font-size:18px;border:0;border-radius:12px;background:#2563eb;color:#fff;font-weight:700;margin-bottom:12px}
+  button:disabled{opacity:.6}
   #result{margin:12px 0;padding:18px;border-radius:12px;text-align:center;background:#333;min-height:96px}
   #result .big{font-size:26px;font-weight:800}
   #result .sub{font-size:16px;margin-top:6px}
@@ -22,37 +23,77 @@
   li{padding:10px 12px;border-bottom:1px solid #333;font-size:16px}
   li small{display:block;color:#999;font-size:13px;margin-top:2px}
   .small{background:#444;font-size:14px;padding:10px;margin-top:20px}
+  #lock{max-width:480px;margin:0 auto;padding:80px 24px}
+  #lock h1{text-align:center;font-size:22px;margin-bottom:24px}
+  #lock input{width:100%;padding:16px;font-size:22px;text-align:center;border-radius:12px;border:0;margin-bottom:12px;letter-spacing:6px}
+  #pinMsg{color:#f87171;text-align:center;min-height:22px}
+  .hidden{display:none}
 </style>
 </head>
 <body>
-<div class="wrap">
+
+<div id="lock">
+  <h1>🔒 지도원 PIN 입력</h1>
+  <input id="pinInput" type="password" inputmode="numeric" placeholder="PIN" autocomplete="off">
+  <button id="pinBtn">확인</button>
+  <div id="pinMsg"></div>
+</div>
+
+<div id="main" class="wrap hidden">
   <button id="start">📷 스캔 시작</button>
   <div id="reader"></div>
   <div id="result"><div class="big">QR을 스캔해 주세요</div></div>
   <h2>오늘 확인 목록 <span id="count"></span></h2>
   <ul id="today"></ul>
-  <button id="resetPin" class="small">PIN 다시 입력</button>
+  <button id="logout" class="small">로그아웃 (PIN 다시 입력)</button>
 </div>
 
 <script>
 const API_URL = 'https://script.google.com/macros/s/AKfycbzak8nUZCw9rXO-_dXclDIi7gfujD3rXkOiDZE2f_LLT0YQ9U-Fs4F1kEqhOnKqplAU/exec';
 
 const $ = id => document.getElementById(id);
-let busy = false, lastCode = '', lastAt = 0;
-
-function getPin() {
-  let p = localStorage.getItem('staffPin');
-  if (!p) { p = prompt('지도원 PIN을 입력하세요') || ''; localStorage.setItem('staffPin', p); }
-  return p;
-}
+let busy = false, lastCode = '', lastAt = 0, scanner = null, timer = null;
 
 async function call(params) {
-  params.pin = getPin();
+  params.pin = localStorage.getItem('staffPin') || '';
   params.t = Date.now();
   const res = await fetch(API_URL + '?' + new URLSearchParams(params));
   const j = await res.json();
-  if (j.type === 'auth') localStorage.removeItem('staffPin');
+  if (j.type === 'auth') lock('PIN이 올바르지 않습니다.');
   return j;
+}
+
+function lock(msg) {
+  localStorage.removeItem('staffPin');
+  if (scanner) { scanner.stop().catch(() => {}); scanner = null; }
+  if (timer) { clearInterval(timer); timer = null; }
+  $('main').classList.add('hidden');
+  $('lock').classList.remove('hidden');
+  $('start').style.display = ''; $('start').disabled = false;
+  $('pinInput').value = '';
+  $('pinMsg').textContent = msg || '';
+}
+
+function unlock() {
+  $('lock').classList.add('hidden');
+  $('main').classList.remove('hidden');
+  loadToday();
+  timer = setInterval(loadToday, 30000);
+}
+
+async function tryPin(pin) {
+  if (!pin) { $('pinMsg').textContent = 'PIN을 입력해 주세요.'; return; }
+  $('pinBtn').disabled = true;
+  $('pinMsg').textContent = '확인 중...';
+  localStorage.setItem('staffPin', pin);
+  try {
+    const r = await call({ action: 'today' });
+    if (r.ok) unlock();
+    else if (r.type !== 'auth') $('pinMsg').textContent = r.msg || '오류가 발생했습니다.';
+  } catch (e) {
+    $('pinMsg').textContent = '네트워크 오류입니다. 다시 시도해 주세요.';
+  }
+  $('pinBtn').disabled = false;
 }
 
 function showResult(r) {
@@ -78,7 +119,7 @@ function showResult(r) {
 
 async function onScan(text) {
   const now = Date.now();
-  if (busy || (text === lastCode && now - lastAt < 4000)) return; // 같은 QR 연속 인식 방지
+  if (busy || (text === lastCode && now - lastAt < 4000)) return;
   busy = true; lastCode = text; lastAt = now;
   showResult({ type: 'loading' });
   try {
@@ -113,7 +154,7 @@ async function loadToday() {
 $('start').onclick = async () => {
   const btn = $('start'); btn.disabled = true;
   try {
-    const scanner = new Html5Qrcode('reader');
+    scanner = new Html5Qrcode('reader');
     await scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 } }, onScan, () => {});
     btn.style.display = 'none';
   } catch (e) {
@@ -122,10 +163,12 @@ $('start').onclick = async () => {
   }
 };
 
-$('resetPin').onclick = () => { localStorage.removeItem('staffPin'); getPin(); loadToday(); };
+$('pinBtn').onclick = () => tryPin($('pinInput').value.trim());
+$('pinInput').addEventListener('keydown', e => { if (e.key === 'Enter') tryPin($('pinInput').value.trim()); });
+$('logout').onclick = () => lock('');
 
-loadToday();
-setInterval(loadToday, 30000); // 지도원 여러 명일 때 목록 동기화
+const saved = localStorage.getItem('staffPin');
+if (saved) tryPin(saved); else lock('');
 </script>
 </body>
 </html>
