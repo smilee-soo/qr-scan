@@ -66,7 +66,7 @@ function showResult(r) {
   el.appendChild(big);
   if (r.name) {
     const s1 = document.createElement('div'); s1.className = 'sub';
-    s1.textContent = `${r.name} ${r.phone4} · ${r.course}`;
+    s1.textContent = `${r.name} · ${r.course}`;
     el.appendChild(s1);
   }
   if (r.msg && r.type !== 'loading') {
@@ -102,7 +102,7 @@ async function loadToday() {
     r.list.forEach(x => {
       const li = document.createElement('li');
       const a = document.createElement('div');
-      a.textContent = `${x.name} ${x.phone4} (${x.time} 확인)`;
+      a.textContent = `${x.name} (${x.time} 확인)`;
       const b = document.createElement('small');
       b.textContent = x.course;
       li.append(a, b); ul.appendChild(li);
