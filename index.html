@@ -53,9 +53,11 @@ const API_URL = 'https://script.google.com/macros/s/AKfycbzak8nUZCw9rXO-_dXclDIi
 
 const $ = id => document.getElementById(id);
 let busy = false, lastCode = '', lastAt = 0, scanner = null, timer = null;
+let PIN = ''; // 폰에 저장하지 않고 메모리에만 보관
+
 
 async function call(params) {
-  params.pin = localStorage.getItem('staffPin') || '';
+  params.pin = PIN;
   params.t = Date.now();
   const res = await fetch(API_URL + '?' + new URLSearchParams(params));
   const j = await res.json();
@@ -64,7 +66,7 @@ async function call(params) {
 }
 
 function lock(msg) {
-  localStorage.removeItem('staffPin');
+  PIN = '';
   if (scanner) { scanner.stop().catch(() => {}); scanner = null; }
   if (timer) { clearInterval(timer); timer = null; }
   $('main').classList.add('hidden');
@@ -85,7 +87,7 @@ async function tryPin(pin) {
   if (!pin) { $('pinMsg').textContent = 'PIN을 입력해 주세요.'; return; }
   $('pinBtn').disabled = true;
   $('pinMsg').textContent = '확인 중...';
-  localStorage.setItem('staffPin', pin);
+  PIN = pin;
   try {
     const r = await call({ action: 'today' });
     if (r.ok) unlock();
@@ -167,8 +169,8 @@ $('pinBtn').onclick = () => tryPin($('pinInput').value.trim());
 $('pinInput').addEventListener('keydown', e => { if (e.key === 'Enter') tryPin($('pinInput').value.trim()); });
 $('logout').onclick = () => lock('');
 
-const saved = localStorage.getItem('staffPin');
-if (saved) tryPin(saved); else lock('');
+localStorage.removeItem('staffPin'); // 예전에 저장된 PIN이 있으면 삭제
+lock('');
 </script>
 </body>
 </html>
