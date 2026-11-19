@@ -4,12 +4,16 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>지도원 QR 스캔</title>
-<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+<link rel="preconnect" href="https://script.google.com">
+<link rel="preconnect" href="https://script.googleusercontent.com">
+<script src="https://cdn.jsdelivr.net/npm/jsqr@1.4.0/dist/jsQR.js"></script>
 <style>
   *{box-sizing:border-box}
   body{margin:0;font-family:-apple-system,'Apple SD Gothic Neo','Malgun Gothic',sans-serif;background:#111;color:#fff}
   .wrap{max-width:480px;margin:0 auto;padding:12px}
-  #reader{width:100%;border-radius:12px;overflow:hidden;background:#000}
+  #reader{position:relative;width:100%;aspect-ratio:1/1;border-radius:12px;overflow:hidden;background:#000;display:none}
+  #reader video{width:100%;height:100%;object-fit:cover;display:block}
+  #reader .frame{position:absolute;inset:10%;border:3px solid rgba(255,255,255,.85);border-radius:12px}
   button{width:100%;padding:16px;font-size:18px;border:0;border-radius:12px;background:#2563eb;color:#fff;font-weight:700;margin-bottom:12px}
   button:disabled{opacity:.6}
   #result{margin:12px 0;padding:18px;border-radius:12px;text-align:center;background:#333;min-height:96px}
@@ -43,7 +47,7 @@
 
 <div id="main" class="wrap hidden">
   <button id="start">📷 스캔 시작</button>
-  <div id="reader"></div>
+  <div id="reader"><video id="video" playsinline muted></video><div class="frame"></div></div>
   <div id="result"><div class="big">QR을 스캔해 주세요</div></div>
   <h2>오늘 확인 목록 <span id="count"></span></h2>
   <ul id="today"></ul>
@@ -54,10 +58,15 @@
 const API_URL = 'https://script.google.com/macros/s/AKfycbzak8nUZCw9rXO-_dXclDIi7gfujD3rXkOiDZE2f_LLT0YQ9U-Fs4F1kEqhOnKqplAU/exec';
 
 const $ = id => document.getElementById(id);
-let busy = false, lastCode = '', lastAt = 0, scanner = null, timer = null;
+let busy = false, lastCode = '', lastAt = 0, timer = null;
 let PIN = ''; // 폰에 저장하지 않고 메모리에만 보관
+let stream = null, detector = null, scanning = false;
+const SIZE = 480;
+const canvas = document.createElement('canvas');
+canvas.width = SIZE; canvas.height = SIZE;
+const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-
+/* ---------- 서버 통신 ---------- */
 async function call(params) {
   params.pin = PIN;
   params.t = Date.now();
@@ -67,9 +76,10 @@ async function call(params) {
   return j;
 }
 
+/* ---------- PIN 잠금 ---------- */
 function lock(msg) {
   PIN = '';
-  if (scanner) { scanner.stop().catch(() => {}); scanner = null; }
+  stopScan();
   if (timer) { clearInterval(timer); timer = null; }
   $('main').classList.add('hidden');
   $('lock').classList.remove('hidden');
@@ -78,10 +88,10 @@ function lock(msg) {
   $('pinMsg').textContent = msg || '';
 }
 
-function unlock() {
+function unlock(list) {
   $('lock').classList.add('hidden');
   $('main').classList.remove('hidden');
-  loadToday();
+  renderList(list);
   timer = setInterval(loadToday, 30000);
 }
 
@@ -92,7 +102,7 @@ async function tryPin(pin) {
   PIN = pin;
   try {
     const r = await call({ action: 'today' });
-    if (r.ok) unlock();
+    if (r.ok) unlock(r.list);
     else if (r.type !== 'auth') $('pinMsg').textContent = r.msg || '오류가 발생했습니다.';
   } catch (e) {
     $('pinMsg').textContent = '네트워크 오류입니다. 다시 시도해 주세요.';
@@ -100,34 +110,52 @@ async function tryPin(pin) {
   $('pinBtn').disabled = false;
 }
 
+/* ---------- 결과 / 목록 표시 ---------- */
 function showResult(r) {
   const el = $('result');
   el.className = r.type || '';
   el.innerHTML = '';
   const titles = { ok: '✅ 확인 완료', used: '⚠️ 이미 확인 처리됨', period: '❌ 수강 기간 아님',
                    invalid: '❌ 확인 불가', auth: '🔒 PIN 오류', loading: '확인 중...' };
-
   const big = document.createElement('div'); big.className = 'big';
   big.textContent = titles[r.type] || '';
   el.appendChild(big);
-
   if (r.course) {
     const c = document.createElement('div'); c.className = 'course';
-    c.textContent = r.course;
-    el.appendChild(c);
+    c.textContent = r.course; el.appendChild(c);
   }
   if (r.name) {
     const n = document.createElement('div'); n.className = 'name';
-    n.textContent = r.name;
-    el.appendChild(n);
+    n.textContent = r.name; el.appendChild(n);
   }
   if (r.msg && r.type !== 'loading') {
     const s = document.createElement('div'); s.className = 'sub';
-    s.textContent = r.msg;
-    el.appendChild(s);
+    s.textContent = r.msg; el.appendChild(s);
   }
 }
 
+function renderList(list) {
+  if (!list) return;
+  $('count').textContent = `(${list.length}건)`;
+  const ul = $('today'); ul.innerHTML = '';
+  list.forEach(x => {
+    const li = document.createElement('li');
+    const a = document.createElement('div');
+    a.textContent = `${x.name} (${x.time} 확인)`;
+    const b = document.createElement('small');
+    b.textContent = x.course;
+    li.append(a, b); ul.appendChild(li);
+  });
+}
+
+async function loadToday() {
+  try {
+    const r = await call({ action: 'today' });
+    if (r.ok) renderList(r.list);
+  } catch (e) {}
+}
+
+/* ---------- 스캔 처리 ---------- */
 async function onScan(text) {
   const now = Date.now();
   if (busy || (text === lastCode && now - lastAt < 4000)) return;
@@ -137,48 +165,89 @@ async function onScan(text) {
     const r = await call({ action: 'scan', code: text });
     showResult(r);
     if (navigator.vibrate) navigator.vibrate(r.ok ? 120 : [120, 80, 120]);
-    loadToday();
+    if (r.list) renderList(r.list);
   } catch (e) {
     showResult({ type: 'invalid', msg: '네트워크 오류입니다. 다시 스캔해 주세요.' });
   } finally {
-    setTimeout(() => busy = false, 1500);
+    setTimeout(() => busy = false, 1000);
   }
 }
 
-async function loadToday() {
-  try {
-    const r = await call({ action: 'today' });
-    if (!r.ok) return;
-    $('count').textContent = `(${r.list.length}건)`;
-    const ul = $('today'); ul.innerHTML = '';
-    r.list.forEach(x => {
-      const li = document.createElement('li');
-      const a = document.createElement('div');
-      a.textContent = `${x.name} (${x.time} 확인)`;
-      const b = document.createElement('small');
-      b.textContent = x.course;
-      li.append(a, b); ul.appendChild(li);
-    });
-  } catch (e) {}
+/* ---------- 카메라 / QR 인식 (반전 QR 지원) ---------- */
+async function startScan() {
+  stream = await navigator.mediaDevices.getUserMedia({
+    audio: false,
+    video: { facingMode: { ideal: 'environment' }, width: { ideal: 1280 }, height: { ideal: 720 } }
+  });
+  const v = $('video');
+  v.srcObject = stream;
+  await v.play();
+  $('reader').style.display = 'block';
+  detector = null;
+  if ('BarcodeDetector' in window) {
+    try {
+      const f = await BarcodeDetector.getSupportedFormats();
+      if (f.includes('qr_code')) detector = new BarcodeDetector({ formats: ['qr_code'] });
+    } catch (e) {}
+  }
+  scanning = true;
+  loop();
+}
+
+function stopScan() {
+  scanning = false;
+  if (stream) { stream.getTracks().forEach(t => t.stop()); stream = null; }
+  const r = $('reader'); if (r) r.style.display = 'none';
+}
+
+async function decodeFrame(v) {
+  const vw = v.videoWidth, vh = v.videoHeight;
+  if (!vw || !vh) return null;
+  const s = Math.min(vw, vh) * 0.8, sx = (vw - s) / 2, sy = (vh - s) / 2;
+  ctx.drawImage(v, sx, sy, s, s, 0, 0, SIZE, SIZE);
+  if (detector) { // 폰 내장 인식기 (빠름)
+    try { const codes = await detector.detect(canvas); if (codes.length) return codes[0].rawValue; } catch (e) {}
+  }
+  // 반전(검은 바탕 흰 무늬) QR까지 인식
+  const img = ctx.getImageData(0, 0, SIZE, SIZE);
+  const r = jsQR(img.data, SIZE, SIZE, { inversionAttempts: detector ? 'onlyInvert' : 'attemptBoth' });
+  return r ? r.data : null;
+}
+
+async function loop() {
+  if (!scanning) return;
+  const v = $('video');
+  if (!busy && v.readyState >= 2) {
+    try { const text = await decodeFrame(v); if (text) onScan(text.trim()); } catch (e) {}
+  }
+  setTimeout(loop, 100);
 }
 
 $('start').onclick = async () => {
   const btn = $('start'); btn.disabled = true;
   try {
-    scanner = new Html5Qrcode('reader');
-    await scanner.start({ facingMode: 'environment' }, { fps: 10, qrbox: { width: 240, height: 240 } }, onScan, () => {});
+    await startScan();
     btn.style.display = 'none';
   } catch (e) {
+    stopScan();
     btn.disabled = false;
     showResult({ type: 'invalid', msg: '카메라를 켤 수 없습니다. 브라우저의 카메라 권한을 허용해 주세요.' });
   }
 };
 
+// 다른 앱으로 나가면 카메라 끄기 (배터리 절약)
+document.addEventListener('visibilitychange', () => {
+  if (document.hidden && scanning) {
+    stopScan();
+    $('start').style.display = ''; $('start').disabled = false;
+  }
+});
+
 $('pinBtn').onclick = () => tryPin($('pinInput').value.trim());
 $('pinInput').addEventListener('keydown', e => { if (e.key === 'Enter') tryPin($('pinInput').value.trim()); });
 $('logout').onclick = () => lock('');
 
-localStorage.removeItem('staffPin'); // 예전에 저장된 PIN이 있으면 삭제
+localStorage.removeItem('staffPin');
 lock('');
 </script>
 </body>
