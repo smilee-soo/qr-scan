@@ -91,6 +91,34 @@ async function hashHex(s) {
 }
 function vib(ok) { if (navigator.vibrate) navigator.vibrate(ok ? 120 : [200, 80, 200]); }
 
+ // 대기 기록을 폰에 백업
+function saveQueue() {
+  try {
+    localStorage.setItem('pendingQueue', JSON.stringify(queue.map(q => (
+      { code: q.code, h: q.h, name: q.name, course: q.course, time: q.time, date: q.date }))));
+  } catch (e) {}
+}
+// 다음 로그인 때 백업된 기록 복구
+function restoreQueue() {
+  let saved = [];
+  try { saved = JSON.parse(localStorage.getItem('pendingQueue') || '[]'); } catch (e) {}
+  const today = kstNow().date;
+  const old = saved.filter(q => q.date !== today);
+  saved.filter(q => q.date === today && !queue.some(x => x.h === q.h))
+       .forEach(q => queue.push(Object.assign(q, { tries: 1 })));
+  if (old.length) addAlert(`⚠️ 지난 날짜에 기록되지 못한 ${old.length}건 (관리자가 시트에 직접 입력 필요): ` +
+    old.map(q => `${q.name} ${q.course} (${q.date} ${q.time})`).join(', '));
+  saveQueue();
+}
+// 페이지가 닫히는 순간 남은 기록 전송
+function beaconQueue() {
+  if (!PIN || !queue.length || !navigator.sendBeacon) return;
+  queue.forEach(q => {
+    navigator.sendBeacon(API_URL, JSON.stringify({ pin: PIN, action: 'scan', code: q.code, tm: q.time }));
+    q.tries = Math.max(q.tries || 0, 1);
+  });
+}
+
 async function call(params) {
   params.pin = PIN;
   params.t = Date.now();
@@ -136,6 +164,7 @@ async function tryPin(pin) {
       $('lock').classList.add('hidden');
       $('main').classList.remove('hidden');
       timer = setInterval(sync, 15000);
+      restoreQueue(); loadToday(); flushQueue();
     } else if (r.type !== 'auth') {
       $('pinMsg').textContent = r.msg || '오류가 발생했습니다.';
     }
@@ -235,8 +264,10 @@ async function onScan(text) {
 
     // 즉시 통과 표시
     used.set(h, k.time);
-    const item = { code: text, h, name: info.n, course: info.c, time: k.time, tries: 0 };
+    const item = { code: text, h, name: info.n, course: info.c, time: k.time, date: k.date, tries: 0 };
     queue.push(item);
+    saveQueue();
+
     listData.unshift({ h, name: info.n, course: info.c, time: k.time, pending: true });
     renderList();
     showResult(Object.assign({ type: 'ok', msg: `${k.time} 확인` }, base));
@@ -252,9 +283,11 @@ async function sendOne(item) {
   item.sending = true;
   const t0 = Date.now();
   try {
-    const r = await call({ action: 'scan', code: item.code });
+    const r = await call({ action: 'scan', code: item.code, tm: item.time });
     if (r.type === 'auth') return;
     queue = queue.filter(q => q !== item);
+    saveQueue();
+
     // 이전 전송이 실제로는 성공했는데 응답만 못 받은 경우는 정상으로 처리
     const mine = r.type === 'used' && r.time === item.time && item.tries > 0;
     if (!r.ok && !mine) {
@@ -351,11 +384,18 @@ $('start').onclick = async () => {
 };
 
 document.addEventListener('visibilitychange', () => {
-  if (document.hidden && scanning) {
-    stopScan();
-    $('start').style.display = ''; $('start').disabled = false;
+  if (document.hidden) {
+    beaconQueue(); // 다른 앱으로 넘어가면 바로 전송
+    if (scanning) { stopScan(); $('start').style.display = ''; $('start').disabled = false; }
+  } else {
+    flushQueue();
   }
 });
+window.addEventListener('pagehide', beaconQueue);
+window.addEventListener('beforeunload', e => {
+  if (queue.length) { e.preventDefault(); e.returnValue = ''; } // 가능한 브라우저에서 경고창
+});
+
 window.addEventListener('online', flushQueue);
 
 $('pinBtn').onclick = () => tryPin($('pinInput').value.trim());
