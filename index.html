@@ -93,6 +93,7 @@ function vib(ok) { if (navigator.vibrate) navigator.vibrate(ok ? 120 : [200, 80,
 
  // 대기 기록을 폰에 백업
 function saveQueue() {
+  if (!PIN) return; // 로그아웃 상태에서는 백업을 덮어쓰지 않음
   try {
     localStorage.setItem('pendingQueue', JSON.stringify(queue.map(q => (
       { code: q.code, h: q.h, name: q.name, course: q.course, time: q.time, date: q.date }))));
