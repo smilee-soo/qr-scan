@@ -24,10 +24,14 @@
   #result.ok{background:#16a34a}
   #result.used{background:#ea580c}
   #result.period,#result.invalid,#result.auth{background:#dc2626}
+  #alerts .al{background:#7f1d1d;border:2px solid #f87171;border-radius:12px;padding:12px;margin:8px 0;font-size:16px;line-height:1.5}
+  #alerts .al small{display:block;color:#fca5a5;font-size:12px;margin-top:4px}
+  #queueInfo{color:#fbbf24;font-size:14px;text-align:center;margin:4px 0}
   h2{font-size:16px;margin:20px 0 8px;color:#bbb}
   ul{list-style:none;padding:0;margin:0}
   li{padding:10px 12px;border-bottom:1px solid #333;font-size:16px}
   li small{display:block;color:#999;font-size:13px;margin-top:2px}
+  li .pend{color:#fbbf24;font-size:12px;margin-left:6px}
   .small{background:#444;font-size:14px;padding:10px;margin-top:20px}
   #lock{max-width:480px;margin:0 auto;padding:80px 24px}
   #lock h1{text-align:center;font-size:22px;margin-bottom:24px}
@@ -49,6 +53,8 @@
   <button id="start">📷 스캔 시작</button>
   <div id="reader"><video id="video" playsinline muted></video><div class="frame"></div></div>
   <div id="result"><div class="big">QR을 스캔해 주세요</div></div>
+  <div id="alerts"></div>
+  <div id="queueInfo"></div>
   <h2>오늘 확인 목록 <span id="count"></span></h2>
   <ul id="today"></ul>
   <button id="logout" class="small">로그아웃 (PIN 다시 입력)</button>
@@ -58,15 +64,33 @@
 const API_URL = 'https://script.google.com/macros/s/AKfycbzak8nUZCw9rXO-_dXclDIi7gfujD3rXkOiDZE2f_LLT0YQ9U-Fs4F1kEqhOnKqplAU/exec';
 
 const $ = id => document.getElementById(id);
+let PIN = '';                 // 폰에 저장하지 않고 메모리에만 보관
 let busy = false, lastCode = '', lastAt = 0, timer = null;
-let PIN = ''; // 폰에 저장하지 않고 메모리에만 보관
+let roster = new Map();       // 해시 → 학생/강의 정보
+let used = new Map();         // 해시 → 확인 시각 (오늘)
+let listData = [];            // 화면 목록
+let queue = [];               // 서버 전송 대기
+let showingH = null, rosterAt = 0, lastApplied = 0;
 let stream = null, detector = null, scanning = false;
 const SIZE = 480;
 const canvas = document.createElement('canvas');
 canvas.width = SIZE; canvas.height = SIZE;
 const ctx = canvas.getContext('2d', { willReadFrequently: true });
 
-/* ---------- 서버 통신 ---------- */
+/* ---------- 공통 ---------- */
+function kstNow() {
+  const d = new Date();
+  return {
+    date: d.toLocaleDateString('sv-SE', { timeZone: 'Asia/Seoul' }),
+    time: d.toLocaleTimeString('en-GB', { timeZone: 'Asia/Seoul', hour: '2-digit', minute: '2-digit' })
+  };
+}
+async function hashHex(s) {
+  const b = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(s));
+  return [...new Uint8Array(b)].map(x => x.toString(16).padStart(2, '0')).join('').slice(0, 32);
+}
+function vib(ok) { if (navigator.vibrate) navigator.vibrate(ok ? 120 : [200, 80, 200]); }
+
 async function call(params) {
   params.pin = PIN;
   params.t = Date.now();
@@ -81,6 +105,8 @@ function lock(msg) {
   PIN = '';
   stopScan();
   if (timer) { clearInterval(timer); timer = null; }
+  roster = new Map(); used = new Map(); listData = []; queue = []; lastApplied = 0;
+  $('alerts').innerHTML = ''; $('queueInfo').textContent = '';
   $('main').classList.add('hidden');
   $('lock').classList.remove('hidden');
   $('start').style.display = ''; $('start').disabled = false;
@@ -88,29 +114,88 @@ function lock(msg) {
   $('pinMsg').textContent = msg || '';
 }
 
-function unlock(list) {
-  $('lock').classList.add('hidden');
-  $('main').classList.remove('hidden');
-  renderList(list);
-  timer = setInterval(loadToday, 30000);
+async function loadInit() {
+  const t0 = Date.now();
+  const r = await call({ action: 'init' });
+  if (r.ok) {
+    roster = new Map(r.roster.map(x => [x.h, x]));
+    rosterAt = Date.now();
+    applyServerList(r.list, t0);
+  }
+  return r;
 }
 
 async function tryPin(pin) {
   if (!pin) { $('pinMsg').textContent = 'PIN을 입력해 주세요.'; return; }
   $('pinBtn').disabled = true;
-  $('pinMsg').textContent = '확인 중...';
+  $('pinMsg').textContent = '명단 불러오는 중...';
   PIN = pin;
   try {
-    const r = await call({ action: 'today' });
-    if (r.ok) unlock(r.list);
-    else if (r.type !== 'auth') $('pinMsg').textContent = r.msg || '오류가 발생했습니다.';
+    const r = await loadInit();
+    if (r.ok) {
+      $('lock').classList.add('hidden');
+      $('main').classList.remove('hidden');
+      timer = setInterval(sync, 15000);
+    } else if (r.type !== 'auth') {
+      $('pinMsg').textContent = r.msg || '오류가 발생했습니다.';
+    }
   } catch (e) {
     $('pinMsg').textContent = '네트워크 오류입니다. 다시 시도해 주세요.';
   }
   $('pinBtn').disabled = false;
 }
 
-/* ---------- 결과 / 목록 표시 ---------- */
+/* ---------- 목록 동기화 ---------- */
+function applyServerList(list, issuedAt) {
+  if (!list || issuedAt < lastApplied) return; // 오래된 응답은 무시
+  lastApplied = issuedAt;
+  used = new Map(list.map(x => [x.h, x.time]));
+  const pend = queue.filter(q => !used.has(q.h));
+  pend.forEach(q => used.set(q.h, q.time));
+  listData = pend.slice().reverse()
+    .map(q => ({ h: q.h, name: q.name, course: q.course, time: q.time, pending: true }))
+    .concat(list);
+  renderList();
+}
+
+function renderList() {
+  $('count').textContent = `(${listData.length}건)`;
+  const ul = $('today'); ul.innerHTML = '';
+  listData.forEach(x => {
+    const li = document.createElement('li');
+    const a = document.createElement('div');
+    a.textContent = `${x.name} (${x.time} 확인)`;
+    if (x.pending) { const p = document.createElement('span'); p.className = 'pend'; p.textContent = '⏳ 기록 중'; a.appendChild(p); }
+    const b = document.createElement('small');
+    b.textContent = x.course;
+    li.append(a, b); ul.appendChild(li);
+  });
+  $('queueInfo').textContent = queue.length ? `⏳ 서버 기록 대기 ${queue.length}건` : '';
+}
+
+async function loadToday() {
+  const t0 = Date.now();
+  try { const r = await call({ action: 'today' }); if (r.ok) applyServerList(r.list, t0); } catch (e) {}
+}
+
+function flushQueue() { queue.forEach(sendOne); }
+
+function sync() {
+  flushQueue();
+  if (Date.now() - rosterAt > 600000) loadInit().catch(() => {}); // 10분마다 명단 갱신
+  else loadToday();
+}
+
+function addAlert(text) {
+  const d = document.createElement('div'); d.className = 'al';
+  d.textContent = text;
+  const s = document.createElement('small'); s.textContent = '눌러서 닫기';
+  d.appendChild(s);
+  d.onclick = () => d.remove();
+  $('alerts').prepend(d);
+}
+
+/* ---------- 결과 표시 ---------- */
 function showResult(r) {
   const el = $('result');
   el.className = r.type || '';
@@ -120,56 +205,87 @@ function showResult(r) {
   const big = document.createElement('div'); big.className = 'big';
   big.textContent = titles[r.type] || '';
   el.appendChild(big);
-  if (r.course) {
-    const c = document.createElement('div'); c.className = 'course';
-    c.textContent = r.course; el.appendChild(c);
-  }
-  if (r.name) {
-    const n = document.createElement('div'); n.className = 'name';
-    n.textContent = r.name; el.appendChild(n);
-  }
-  if (r.msg && r.type !== 'loading') {
-    const s = document.createElement('div'); s.className = 'sub';
-    s.textContent = r.msg; el.appendChild(s);
-  }
+  if (r.course) { const c = document.createElement('div'); c.className = 'course'; c.textContent = r.course; el.appendChild(c); }
+  if (r.name) { const n = document.createElement('div'); n.className = 'name'; n.textContent = r.name; el.appendChild(n); }
+  if (r.msg && r.type !== 'loading') { const s = document.createElement('div'); s.className = 'sub'; s.textContent = r.msg; el.appendChild(s); }
 }
 
-function renderList(list) {
-  if (!list) return;
-  $('count').textContent = `(${list.length}건)`;
-  const ul = $('today'); ul.innerHTML = '';
-  list.forEach(x => {
-    const li = document.createElement('li');
-    const a = document.createElement('div');
-    a.textContent = `${x.name} (${x.time} 확인)`;
-    const b = document.createElement('small');
-    b.textContent = x.course;
-    li.append(a, b); ul.appendChild(li);
-  });
-}
-
-async function loadToday() {
-  try {
-    const r = await call({ action: 'today' });
-    if (r.ok) renderList(r.list);
-  } catch (e) {}
-}
-
-/* ---------- 스캔 처리 ---------- */
+/* ---------- 스캔 처리: 폰에서 즉시 판정 → 서버는 뒤에서 기록 ---------- */
 async function onScan(text) {
   const now = Date.now();
   if (busy || (text === lastCode && now - lastAt < 4000)) return;
   busy = true; lastCode = text; lastAt = now;
+  try {
+    const h = await hashHex(text);
+    const info = roster.get(h);
+    if (!info) { showingH = null; await serverScan(text); return; } // 명단에 없으면 서버에 직접 확인
+
+    showingH = h;
+    const k = kstNow();
+    const base = { name: info.n, course: info.c };
+
+    if ((info.s && k.date < info.s) || (info.e && k.date > info.e)) {
+      showResult(Object.assign({ type: 'period', msg: `수강 기간: ${info.s} ~ ${info.e}` }, base));
+      vib(false); return;
+    }
+    if (used.has(h)) {
+      showResult(Object.assign({ type: 'used', msg: `${used.get(h)}에 이미 확인됨` }, base));
+      vib(false); return;
+    }
+
+    // 즉시 통과 표시
+    used.set(h, k.time);
+    const item = { code: text, h, name: info.n, course: info.c, time: k.time, tries: 0 };
+    queue.push(item);
+    listData.unshift({ h, name: info.n, course: info.c, time: k.time, pending: true });
+    renderList();
+    showResult(Object.assign({ type: 'ok', msg: `${k.time} 확인` }, base));
+    vib(true);
+    sendOne(item);
+  } finally {
+    setTimeout(() => busy = false, 300);
+  }
+}
+
+async function sendOne(item) {
+  if (item.sending) return;
+  item.sending = true;
+  const t0 = Date.now();
+  try {
+    const r = await call({ action: 'scan', code: item.code });
+    if (r.type === 'auth') return;
+    queue = queue.filter(q => q !== item);
+    // 이전 전송이 실제로는 성공했는데 응답만 못 받은 경우는 정상으로 처리
+    const mine = r.type === 'used' && r.time === item.time && item.tries > 0;
+    if (!r.ok && !mine) {
+      if (showingH === item.h) showResult(r);
+      addAlert(`⚠️ ${item.name} · ${item.course} — ${r.msg || '확인 불가'} (다른 지도원이 먼저 처리했을 수 있음)`);
+      vib(false);
+    }
+    if (r.list) applyServerList(r.list, t0);
+    else {
+      listData = listData.filter(x => !(x.pending && x.h === item.h));
+      used.delete(item.h);
+    }
+  } catch (e) {
+    item.tries++; // 네트워크 오류 → 대기열에 남겨두고 다음 동기화 때 재시도
+  } finally {
+    item.sending = false;
+    renderList();
+  }
+}
+
+async function serverScan(text) {
   showResult({ type: 'loading' });
+  const t0 = Date.now();
   try {
     const r = await call({ action: 'scan', code: text });
-    showResult(r);
-    if (navigator.vibrate) navigator.vibrate(r.ok ? 120 : [120, 80, 120]);
-    if (r.list) renderList(r.list);
+    if (r.type === 'auth') return;
+    showResult(r); vib(r.ok);
+    if (r.list) applyServerList(r.list, t0);
+    if (r.ok) loadInit().catch(() => {}); // 새로 추가된 학생이면 명단 갱신
   } catch (e) {
     showResult({ type: 'invalid', msg: '네트워크 오류입니다. 다시 스캔해 주세요.' });
-  } finally {
-    setTimeout(() => busy = false, 1000);
   }
 }
 
@@ -205,10 +321,9 @@ async function decodeFrame(v) {
   if (!vw || !vh) return null;
   const s = Math.min(vw, vh) * 0.8, sx = (vw - s) / 2, sy = (vh - s) / 2;
   ctx.drawImage(v, sx, sy, s, s, 0, 0, SIZE, SIZE);
-  if (detector) { // 폰 내장 인식기 (빠름)
+  if (detector) {
     try { const codes = await detector.detect(canvas); if (codes.length) return codes[0].rawValue; } catch (e) {}
   }
-  // 반전(검은 바탕 흰 무늬) QR까지 인식
   const img = ctx.getImageData(0, 0, SIZE, SIZE);
   const r = jsQR(img.data, SIZE, SIZE, { inversionAttempts: detector ? 'onlyInvert' : 'attemptBoth' });
   return r ? r.data : null;
@@ -220,7 +335,7 @@ async function loop() {
   if (!busy && v.readyState >= 2) {
     try { const text = await decodeFrame(v); if (text) onScan(text.trim()); } catch (e) {}
   }
-  setTimeout(loop, 100);
+  setTimeout(loop, 80);
 }
 
 $('start').onclick = async () => {
@@ -235,17 +350,20 @@ $('start').onclick = async () => {
   }
 };
 
-// 다른 앱으로 나가면 카메라 끄기 (배터리 절약)
 document.addEventListener('visibilitychange', () => {
   if (document.hidden && scanning) {
     stopScan();
     $('start').style.display = ''; $('start').disabled = false;
   }
 });
+window.addEventListener('online', flushQueue);
 
 $('pinBtn').onclick = () => tryPin($('pinInput').value.trim());
 $('pinInput').addEventListener('keydown', e => { if (e.key === 'Enter') tryPin($('pinInput').value.trim()); });
-$('logout').onclick = () => lock('');
+$('logout').onclick = () => {
+  if (queue.length && !confirm(`아직 서버에 기록되지 않은 ${queue.length}건이 있습니다. 로그아웃할까요?`)) return;
+  lock('');
+};
 
 localStorage.removeItem('staffPin');
 lock('');
